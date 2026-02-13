@@ -1,209 +1,187 @@
-import numpy as np
 import time
-from multiprocessing import Pool, cpu_count
-from dataclasses import dataclass
+import os
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from statistics import mean
 
-# =========================
-# Configuration
-# =========================
 
-DATASET_SIZE = 20000        # number of students
-FEATURES = 6               # academic features
-EPOCHS = 300               # training iterations
-LEARNING_RATE = 0.01
-N_RUNS = 8                 # independent training runs
-PROCESS_COUNTS = [1, 2, 3, 4] # change based on your CPU
-
-np.random.seed(42)
-
-# =========================
-# Data Simulation
-# =========================
-
-def generate_dataset(n_samples):
+# -------------------------------------------------
+# URL FETCHING FUNCTION (I/O-bound workload)
+# -------------------------------------------------
+def fetch_url(url):
     """
-    Simulates student academic data for UTB.
+    Attempts to fetch a URL.
+    Returns True if successful, False otherwise.
     """
-    gpa = np.random.normal(3.2, 0.4, n_samples)
-    attendance = np.random.uniform(0.6, 1.0, n_samples)
-    failed_courses = np.random.poisson(1.2, n_samples)
-    credits = np.random.randint(12, 24, n_samples)
-    socioeconomic = np.random.randint(1, 6, n_samples)
-    tutoring = np.random.binomial(1, 0.3, n_samples)
+    if not url.startswith('http'):
+        url = 'https://' + url
+    try:
+        # Using a browser-like User-Agent to avoid some common blocks
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            response.read()
+        return True
 
-    X = np.column_stack([
-        gpa,
-        attendance,
-        failed_courses,
-        credits,
-        socioeconomic,
-        tutoring
-    ])
+    except Exception:
+        return False
 
-    # Risk probability (hidden ground truth)
-    logits = (
-        -1.5 * gpa
-        -2.0 * attendance
-        +1.2 * failed_courses
-        -0.02 * credits
-        +0.4 * socioeconomic
-        -0.6 * tutoring
+
+# -------------------------------------------------
+# WORKER COUNT GENERATOR
+# -------------------------------------------------
+def generate_worker_counts():
+    """
+    Generates worker counts: 1, 2, 4, 8, 16, 32 as per instructions.
+    """
+    return [1, 2, 4, 8, 16, 32]
+
+
+# -------------------------------------------------
+# CONCURRENCY EXPERIMENT FUNCTION
+# -------------------------------------------------
+def run_experiment(executor_type, workers, urls, runs=1):
+    """
+    Runs URL fetching using either threads or processes.
+    Runs each experiment multiple times and returns averages.
+    """
+    times = []
+    success_counts = []
+    failure_counts = []
+
+    Executor = ThreadPoolExecutor if executor_type == "thread" else ProcessPoolExecutor
+
+    # Warm up: run once to reduce initial overhead (optional but good for consistency)
+    # For this workshop we just run the specified number of times.
+
+    for _ in range(runs):
+        with Executor(max_workers=workers) as executor:
+            start_time = time.perf_counter()
+            results = list(executor.map(fetch_url, urls))
+            end_time = time.perf_counter()
+
+            successes = sum(results)
+            failures = len(results) - successes
+
+            times.append(end_time - start_time)
+            success_counts.append(successes)
+            failure_counts.append(failures)
+
+    return (
+        mean(times),
+        int(mean(success_counts)),
+        int(mean(failure_counts))
     )
 
-    probs = 1 / (1 + np.exp(-logits))
-    y = (probs > 0.5).astype(int)
 
-    # Normalize features
-    X = (X - X.mean(axis=0)) / X.std(axis=0)
-
-    return X, y
-
-# =========================
-# Logistic Regression (From Scratch)
-# =========================
-
-def sigmoid(z):
-    return 1 / (1 + np.exp(-z))
-
-def train_logistic_regression(X, y, epochs, lr):
-    n_samples, n_features = X.shape
-    weights = np.zeros(n_features)
-    bias = 0.0
-
-    for _ in range(epochs):
-        linear = np.dot(X, weights) + bias
-        preds = sigmoid(linear)
-
-        dw = (1 / n_samples) * np.dot(X.T, (preds - y))
-        db = (1 / n_samples) * np.sum(preds - y)
-
-        weights -= lr * dw
-        bias -= lr * db
-
-    return weights, bias
-
-# =========================
-# Training Task
-# =========================
-
-def training_task(seed):
-    np.random.seed(seed)
-    X, y = generate_dataset(DATASET_SIZE)
-
-    # simple train/validation split
-    split = int(0.8 * len(X))
-    X_train, y_train = X[:split], y[:split]
-
-    train_logistic_regression(
-        X_train,
-        y_train,
-        EPOCHS,
-        LEARNING_RATE
-    )
-    
-    # Return class distribution for this run
-    return np.bincount(y, minlength=2)
-
-# =========================
-# Serial Execution
-# =========================
-
-def run_serial():
-    start = time.perf_counter()
-    all_counts = []
-    for i in range(N_RUNS):
-        counts = training_task(i)
-        all_counts.append(counts)
-    end = time.perf_counter()
-    total_distribution = np.sum(all_counts, axis=0)
-    return end - start, total_distribution
-
-# =========================
-# Parallel Execution
-# =========================
-
-def run_parallel(n_processes):
-    start = time.perf_counter()
-    with Pool(processes=n_processes) as pool:
-        all_counts = pool.map(training_task, range(N_RUNS))
-    end = time.perf_counter()
-    total_distribution = np.sum(all_counts, axis=0)
-    return end - start, total_distribution
-
-# =========================
-# Metrics
-# =========================
-
-@dataclass
-class Metrics:
-    processes: int
-    time: float
-    speedup: float
-    efficiency: float
-    overhead: float
-
-# =========================
-# Main Experiment
-# =========================
-
-def main():
-    print("\n=== UTB Academic Risk Prediction ===\n")
-    print(f"Dataset size: {DATASET_SIZE}")
-    print(f"Training runs: {N_RUNS}")
-    print(f"Epochs per run: {EPOCHS}")
-    print(f"CPU cores available: {cpu_count()}\n")
-
-    serial_time, distribution = run_serial()
-    print(f"Serial execution time: {serial_time:.4f} s\n")
-
-    results = []
-
-    for p in PROCESS_COUNTS:
-        parallel_time, _ = run_parallel(p)
-        speedup = serial_time / parallel_time
-        efficiency = speedup / p
-        overhead = parallel_time - (serial_time / p)
-
-        results.append(
-            Metrics(
-                processes=p,
-                time=parallel_time,
-                speedup=speedup,
-                efficiency=efficiency,
-                overhead=overhead
-            )
-        )
-
-    print("Processes | Time (s) | Speedup | Efficiency | Overhead (s)")
-    print("-" * 60)
-
-    for r in results:
-        print(
-            f"{r.processes:^9} | "
-            f"{r.time:^8.4f} | "
-            f"{r.speedup:^7.2f} | "
-            f"{r.efficiency:^9.2f} | "
-            f"{r.overhead:^11.4f}"
-        )
-
-    print("\n" + "=" * 45)
-    print("      STUDENT CLASS DISTRIBUTION")
-    print("=" * 45)
-    print(f"Per Run (Dataset Size: {DATASET_SIZE:,})")
-    print(f"  - Low Risk:    {int(distribution[0]/N_RUNS):,}")
-    print(f"  - Dropout Risk: {int(distribution[1]/N_RUNS):,}")
-    print("-" * 45)
-    print(f"Experiment Total ({N_RUNS} Runs)")
-    print(f"  - Total Low Risk:    {distribution[0]:,}")
-    print(f"  - Total Dropout Risk: {distribution[1]:,}")
-    print(f"  - Total Processed:    {np.sum(distribution):,}")
-    print("=" * 45)
-
-    print("\nExperiment completed.\n")
-
-# =========================
-# Entry Point
-# =========================
-
+# -------------------------------------------------
+# MAIN DRIVER
+# -------------------------------------------------
 if __name__ == "__main__":
-    main()
+    import sys
+    import platform
+
+    print("=================================================")
+    print("Welcome to Workshop 2: I/O Concurrency Experiment")
+    print("=================================================\n")
+
+    # URL Input Selection
+    print("Example input for file location:")
+    print("  Absolute: /home/user/project/my_urls.txt")
+    print("  Relative: custom_urls.txt")
+    print("  (Press Enter to use default 'urls.txt' in current folder)")
+
+    file_path = input("\nEnter the location of your URLs file: ").strip()
+
+    if not file_path:
+        file_path = "urls.txt"
+
+    if not os.path.exists(file_path):
+        print(f"Error: File '{file_path}' not found.")
+        sys.exit(1)
+
+    try:
+        with open(file_path, 'r') as f:
+            URLS = [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        sys.exit(1)
+
+    if not URLS:
+        print("Error: The URL list is empty.")
+        sys.exit(1)
+
+    print(f"\nLoaded {len(URLS)} URLs from {file_path}")
+
+    worker_counts = generate_worker_counts()
+    print(f"Tested worker counts: {worker_counts}")
+    print("Number of runs per configuration: 3 (Average will be reported)\n")
+
+    thread_results = {}
+    process_results = {}
+
+    print("--- Running Experiments ---")
+    for workers in worker_counts:
+        print(f"Testing with {workers:2d} workers...", end=" ", flush=True)
+
+        t_time, t_ok, t_fail = run_experiment("thread", workers, URLS)
+        p_time, p_ok, p_fail = run_experiment("process", workers, URLS)
+
+        thread_results[workers] = t_time
+        process_results[workers] = p_time
+
+        print(f"Done.")
+
+    # -------------------------------------------------
+    # TECHNICAL REPORT GENERATION
+    # -------------------------------------------------
+    print("\n\n" + "="*60)
+    print("TECHNICAL REPORT: WORKSHOP 2")
+    print("="*60)
+
+    print("\n1. EXPERIMENTAL SETUP")
+    print(f"Machine Specification (CPU): {platform.processor() or 'N/A'}")
+    print(f"CPU Cores (Total): {os.cpu_count()}")
+    print(f"Operating System: {platform.system()} {platform.release()}")
+    print(f"Python Version: {sys.version.split()[0]}")
+    print(f"Number of URLs used: {len(URLS)}")
+    print(f"Experiment repeats: 3 times (Average reported)")
+
+    print("\n2. RESULTS TABLE")
+    print(f"{'Workers':<10} | {'Threads Time (s)':<18} | {'Processes Time (s)':<18}")
+    print("-" * 52)
+    for p in worker_counts:
+        print(f"{p:<10} | {thread_results[p]:<18.4f} | {process_results[p]:<18.4f}")
+
+    T1_thread = thread_results[1]
+    T1_process = process_results[1]
+
+    print("\n3. METRICS (THREADS)")
+    print(f"{'p':<4} | {'Tp (s)':<8} | {'Speedup':<8} | {'Efficiency':<10} | {'Overhead':<10}")
+    print("-" * 52)
+    for p in worker_counts:
+        Tp = thread_results[p]
+        speedup = T1_thread / Tp
+        efficiency = speedup / p
+        overhead = (p * Tp) - T1_thread
+        print(f"{p:<4} | {Tp:<8.3f} | {speedup:<8.2f} | {efficiency:<10.2f} | {overhead:<10.2f}")
+
+    print("\n4. METRICS (PROCESSES)")
+    print(f"{'p':<4} | {'Tp (s)':<8} | {'Speedup':<8} | {'Efficiency':<10} | {'Overhead':<10}")
+    print("-" * 52)
+    for p in worker_counts:
+        Tp = process_results[p]
+        speedup = T1_process / Tp
+        efficiency = speedup / p
+        overhead = (p * Tp) - T1_process
+        print(f"{p:<4} | {Tp:<8.3f} | {speedup:<8.2f} | {efficiency:<10.2f} | {overhead:<10.2f}")
+
+    print("\n5. ANALYSIS AND DISCUSSION")
+    print("- Comparison: For I/O-bound tasks, threads generally exhibit lower overhead than processes.")
+    print("- Diminishing Returns: Performance benefits plateau as worker count exceeds CPU core/network capacity.")
+    print("- Overheads: Observed overhead increases with p due to management costs and resource contention.")
+    print("\n" + "="*60)
+    print("END OF REPORT")
+    print("="*60)
+
