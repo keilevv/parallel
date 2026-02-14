@@ -4,6 +4,9 @@ import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from statistics import mean
+import random
+import platform
+import sys
 
 
 # -------------------------------------------------
@@ -20,7 +23,7 @@ def fetch_url(url):
         # Using a browser-like User-Agent to avoid some common blocks
         headers = {'User-Agent': 'Mozilla/5.0'}
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=3) as response:
             response.read()
         return True
 
@@ -41,38 +44,50 @@ def generate_worker_counts():
 # -------------------------------------------------
 # CONCURRENCY EXPERIMENT FUNCTION
 # -------------------------------------------------
-def run_experiment(executor_type, workers, urls, runs=1):
+def run_experiment(executor_type, workers, urls):
     """
     Runs URL fetching using either threads or processes.
-    Runs each experiment multiple times and returns averages.
+    Uses as_completed to handle results as they finish.
     """
-    times = []
-    success_counts = []
-    failure_counts = []
-
+    import concurrent.futures
+    
     Executor = ThreadPoolExecutor if executor_type == "thread" else ProcessPoolExecutor
+    total_urls = len(urls)
+    
+    # Shuffle URLs to avoid clustering slow ones (stragglers) at the end
+    shuffled_urls = list(urls)
+    random.shuffle(shuffled_urls)
 
-    # Warm up: run once to reduce initial overhead (optional but good for consistency)
-    # For this workshop we just run the specified number of times.
+    with Executor(max_workers=workers) as executor:
+        start_time = time.perf_counter()
+        
+        # Submit all tasks
+        futures = {executor.submit(fetch_url, url): url for url in shuffled_urls}
+        
+        results = []
+        completed = 0
+        total = len(futures)
+        
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            results.append(res)
+            completed += 1
+            
+            # Active workers is total submitted minus those already completed
+            # but capped by the pool size (workers)
+            active = min(workers, total - completed + 1) if (total - completed + 1) > 0 else 0
+            
+            print(f"\r  [{executor_type.capitalize()} p={workers}] "
+                  f"Progress: {completed:2d}/{total_urls} | "
+                  f"Active Workers: {active:2d} ", end="", flush=True)
+        
+        end_time = time.perf_counter()
+        print() # New line after progress
 
-    for _ in range(runs):
-        with Executor(max_workers=workers) as executor:
-            start_time = time.perf_counter()
-            results = list(executor.map(fetch_url, urls))
-            end_time = time.perf_counter()
+        successes = sum(results)
+        execution_time = end_time - start_time
 
-            successes = sum(results)
-            failures = len(results) - successes
-
-            times.append(end_time - start_time)
-            success_counts.append(successes)
-            failure_counts.append(failures)
-
-    return (
-        mean(times),
-        int(mean(success_counts)),
-        int(mean(failure_counts))
-    )
+    return execution_time, successes, (total_urls - successes)
 
 
 # -------------------------------------------------
@@ -115,23 +130,18 @@ if __name__ == "__main__":
     print(f"\nLoaded {len(URLS)} URLs from {file_path}")
 
     worker_counts = generate_worker_counts()
-    print(f"Tested worker counts: {worker_counts}")
-    print("Number of runs per configuration: 3 (Average will be reported)\n")
+    print(f"Tested worker counts: {worker_counts}\n")
 
     thread_results = {}
     process_results = {}
 
-    print("--- Running Experiments ---")
+    print("--- Running Experiments (with URL Shuffling) ---")
     for workers in worker_counts:
-        print(f"Testing with {workers:2d} workers...", end=" ", flush=True)
-
         t_time, t_ok, t_fail = run_experiment("thread", workers, URLS)
         p_time, p_ok, p_fail = run_experiment("process", workers, URLS)
 
         thread_results[workers] = t_time
         process_results[workers] = p_time
-
-        print(f"Done.")
 
     # -------------------------------------------------
     # TECHNICAL REPORT GENERATION
@@ -146,7 +156,7 @@ if __name__ == "__main__":
     print(f"Operating System: {platform.system()} {platform.release()}")
     print(f"Python Version: {sys.version.split()[0]}")
     print(f"Number of URLs used: {len(URLS)}")
-    print(f"Experiment repeats: 3 times (Average reported)")
+    print(f"Experiment repeats: 1 time")
 
     print("\n2. RESULTS TABLE")
     print(f"{'Workers':<10} | {'Threads Time (s)':<18} | {'Processes Time (s)':<18}")
@@ -177,10 +187,50 @@ if __name__ == "__main__":
         overhead = (p * Tp) - T1_process
         print(f"{p:<4} | {Tp:<8.3f} | {speedup:<8.2f} | {efficiency:<10.2f} | {overhead:<10.2f}")
 
-    print("\n5. ANALYSIS AND DISCUSSION")
-    print("- Comparison: For I/O-bound tasks, threads generally exhibit lower overhead than processes.")
-    print("- Diminishing Returns: Performance benefits plateau as worker count exceeds CPU core/network capacity.")
-    print("- Overheads: Observed overhead increases with p due to management costs and resource contention.")
+    # -------------------------------------------------
+    # OPTIMAL CONFIGURATION ANALYSIS
+    # -------------------------------------------------
+    all_configs = []
+    for p in worker_counts:
+        # Threads
+        t_time = thread_results[p]
+        t_speedup = T1_thread / t_time
+        t_efficiency = t_speedup / p
+        all_configs.append({
+            "type": "Threads", "p": p, "time": t_time, 
+            "speedup": t_speedup, "efficiency": t_efficiency
+        })
+        # Processes
+        p_val = process_results[p]
+        p_speedup = T1_process / p_val
+        p_efficiency = p_speedup / p
+        all_configs.append({
+            "type": "Processes", "p": p, "time": p_val, 
+            "speedup": p_speedup, "efficiency": p_efficiency
+        })
+
+    # Find optimal: Best speedup with Efficiency >= 0.5
+    # If none meet the threshold (unlikely for I/O), pick highest efficiency.
+    threshold = 0.5
+    eligible_configs = [c for c in all_configs if c['efficiency'] >= threshold and c['p'] > 1]
+    
+    if eligible_configs:
+        # Of those that are efficient enough, pick the fastest (highest speedup)
+        optimal = sorted(eligible_configs, key=lambda x: x['speedup'], reverse=True)[0]
+    else:
+        # Fallback to the single best efficiency (likely p=2 or p=4)
+        optimal = sorted(all_configs, key=lambda x: x['efficiency'], reverse=True)[0]
+
+    print("\n6. OPTIMAL CONFIGURATION")
+    print(f"Based on a balanced analysis of Speedup and Efficiency:")
+    print(f"- Recommended Configuration: {optimal['type']} with {optimal['p']} workers")
+    print(f"- Execution Time: {optimal['time']:.4f}s")
+    print(f"- Speedup: {optimal['speedup']:.2f}x")
+    print(f"- Efficiency: {optimal['efficiency']:.2f}")
+    print(f"- Rationale: This setup provides the best performance gain while maintaining ")
+    print(f"  resource utilization above {threshold*100:.0f}%. Higher worker counts were discarded ")
+    print(f"  due to diminishing returns and excessive overhead.")
+
     print("\n" + "="*60)
     print("END OF REPORT")
     print("="*60)

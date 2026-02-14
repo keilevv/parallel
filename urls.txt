@@ -38,3 +38,13 @@ https://httpbin.org/status/404
 https://httpbin.org/status/500
 https://httpbin.org/delay/2
 https://httpbin.org/delay/5
+https://www.google.com
+https://www.github.com
+https://www.python.org
+https://www.wikipedia.org
+https://www.microsoft.com
+https://www.apple.com
+https://www.amazon.com
+https://www.facebook.com
+https://www.twitter.com
+https://www.reddit.com
