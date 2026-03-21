@@ -64,25 +64,33 @@ def fetch_json(url):
         logging.error(f"Error fetching {url}: {e}")
         return None
 
+# Global APIs Caches and Locks
+weather_cache = {}
+air_cache = {}
+weather_lock = threading.Lock()
+air_lock = threading.Lock()
+nominatim_lock = threading.Lock()
+
 def get_coordinates(zip_code):
     # Use Nominatim (OpenStreetMap) API to fetch latitude and longitude dynamically
     # Nominatim requires a descriptive User-Agent and limits to 1 request per second
     url = f"https://nominatim.openstreetmap.org/search?postalcode={urllib.parse.quote(zip_code)}&country=Colombia&format=json"
     
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'producer-consumer-test-script/1.0'})
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode())
+        with nominatim_lock:
+            req = urllib.request.Request(url, headers={'User-Agent': 'producer-consumer-test-script/1.0'})
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+                
+            # Respect OpenStreetMap's acceptable use policy (1 req/sec max strictly enforced across all threads)
+            time.sleep(1)
             
-        # Respect OpenStreetMap's acceptable use policy (1 req/sec max)
-        time.sleep(1)
-        
-        if data and len(data) > 0:
-            res = data[0]
-            lat = float(res.get('lat', 0))
-            lon = float(res.get('lon', 0))
-            if lat and lon:
-                return lat, lon
+            if data and len(data) > 0:
+                res = data[0]
+                lat = float(res.get('lat', 0))
+                lon = float(res.get('lon', 0))
+                if lat and lon:
+                    return lat, lon
                 
     except Exception as e:
         logging.error(f"Geocoding API error for {zip_code}: {e}")
@@ -108,12 +116,32 @@ def get_coordinates(zip_code):
     return 4.6097, -74.0817
 
 def fetch_weather_history(lat, lon):
+    with weather_lock:
+        if (lat, lon) in weather_cache:
+            logging.info(f"CACHE HIT: Returning cached Weather for ({lat}, {lon})")
+            return weather_cache[(lat, lon)]
+            
+    logging.info(f"API REQUEST: Fetching Weather from Open-Meteo for ({lat}, {lon})")
     url = f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}&start_date=2024-01-01&end_date=2024-01-01&hourly=temperature_2m,precipitation,wind_speed_10m"
-    return fetch_json(url)
+    res = fetch_json(url)
+    
+    with weather_lock:
+        weather_cache[(lat, lon)] = res
+    return res
 
 def fetch_air_quality_history(lat, lon):
+    with air_lock:
+        if (lat, lon) in air_cache:
+            logging.info(f"CACHE HIT: Returning cached Air Quality for ({lat}, {lon})")
+            return air_cache[(lat, lon)]
+            
+    logging.info(f"API REQUEST: Fetching Air Quality from Open-Meteo for ({lat}, {lon})")
     url = f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat}&longitude={lon}&start_date=2024-01-01&end_date=2024-01-01&hourly=pm10,pm2_5,ozone"
-    return fetch_json(url)
+    res = fetch_json(url)
+    
+    with air_lock:
+        air_cache[(lat, lon)] = res
+    return res
 
 def process_zip_pattern(pattern):
     zips = expand_zip_codes(pattern)
@@ -134,10 +162,7 @@ class Producer(threading.Thread):
                 logging.warning(f"Could not find coordinates for {zc}, skipping")
                 continue
             
-            logging.info(f"Fetching weather for {zc} ({lat}, {lon})")
             weather = fetch_weather_history(lat, lon)
-            
-            logging.info(f"Fetching air quality for {zc} ({lat}, {lon})")
             air = fetch_air_quality_history(lat, lon)
             
             payload = {
@@ -153,28 +178,23 @@ class Producer(threading.Thread):
         logging.info("Producer finished fetching")
 
 class Consumer(threading.Thread):
-    def __init__(self, queue, csv_filename):
-        super().__init__(name="Consumer")
+    def __init__(self, queue, writer, csv_lock, name="Consumer"):
+        super().__init__(name=name)
         self.queue = queue
-        self.csv_filename = csv_filename
+        self.writer = writer
+        self.csv_lock = csv_lock
 
     def run(self):
-        with open(self.csv_filename, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['Timestamp', 'Region (ZIP)', 'Latitude', 'Longitude', 
-                             'Temperature (C)', 'Precipitation (mm)', 'Wind Speed (km/h)', 
-                             'PM10', 'PM2.5', 'Ozone'])
+        while True:
+            item = self.queue.get()
+            if item is None:
+                logging.info(f"{self.name} received shutdown signal")
+                break
             
-            while True:
-                item = self.queue.get()
-                if item is None:
-                    logging.info("Consumer received shutdown signal")
-                    break
-                
-                logging.info(f"Consumer processing data for {item['zip']}")
-                self.aggregate_and_save(item, writer)
+            logging.info(f"{self.name} processing data for {item['zip']}")
+            self.aggregate_and_save(item)
 
-    def aggregate_and_save(self, item, writer):
+    def aggregate_and_save(self, item):
         weather = item.get('weather')
         air = item.get('air')
         if not weather or not air or 'hourly' not in weather or 'hourly' not in air:
@@ -186,20 +206,22 @@ class Consumer(threading.Thread):
 
         times = w_hourly.get('time', [])
         
-        for i in range(len(times)):
-            t = times[i]
-            temp = w_hourly['temperature_2m'][i] if i < len(w_hourly['temperature_2m']) else None
-            precip = w_hourly['precipitation'][i] if i < len(w_hourly['precipitation']) else None
-            wind = w_hourly['wind_speed_10m'][i] if i < len(w_hourly['wind_speed_10m']) else None
-            
-            pm10 = a_hourly.get('pm10', [])[i] if i < len(a_hourly.get('pm10', [])) else None
-            pm25 = a_hourly.get('pm2_5', [])[i] if i < len(a_hourly.get('pm2_5', [])) else None
-            ozone = a_hourly.get('ozone', [])[i] if i < len(a_hourly.get('ozone', [])) else None
-            
-            writer.writerow([
-                t, item['zip'], item['lat'], item['lon'],
-                temp, precip, wind, pm10, pm25, ozone
-            ])
+        # We lock the CSV write so rows don't get mixed up if multiple consumers process concurrently
+        with self.csv_lock:
+            for i in range(len(times)):
+                t = times[i]
+                temp = w_hourly['temperature_2m'][i] if i < len(w_hourly['temperature_2m']) else None
+                precip = w_hourly['precipitation'][i] if i < len(w_hourly['precipitation']) else None
+                wind = w_hourly['wind_speed_10m'][i] if i < len(w_hourly['wind_speed_10m']) else None
+                
+                pm10 = a_hourly.get('pm10', [])[i] if i < len(a_hourly.get('pm10', [])) else None
+                pm25 = a_hourly.get('pm2_5', [])[i] if i < len(a_hourly.get('pm2_5', [])) else None
+                ozone = a_hourly.get('ozone', [])[i] if i < len(a_hourly.get('ozone', [])) else None
+                
+                self.writer.writerow([
+                    t, item['zip'], item['lat'], item['lon'],
+                    temp, precip, wind, pm10, pm25, ozone
+                ])
 
 def run_serial(zip_codes, out_file):
     logging.info("--- Starting Serial Execution ---")
@@ -218,10 +240,7 @@ def run_serial(zip_codes, out_file):
                 logging.warning(f"Could not find coordinates for {zc}, skipping")
                 continue
             
-            logging.info(f"Fetching weather for {zc} ({lat}, {lon})")
             weather = fetch_weather_history(lat, lon)
-            
-            logging.info(f"Fetching air quality for {zc} ({lat}, {lon})")
             air = fetch_air_quality_history(lat, lon)
             
             logging.info(f"Saving data for {zc}")
@@ -252,17 +271,55 @@ def run_threaded(zip_codes, out_file):
     logging.info("--- Starting Threaded Execution ---")
     start_time = time.time()
     
-    queue = ThreadSafeQueue(max_size=5)
-    producer = Producer(queue, zip_codes)
-    consumer = Consumer(queue, out_file)
+    import math
+    import os
     
-    producer.start()
-    consumer.start()
+    total_zips = len(zip_codes)
+    cpu_cores = os.cpu_count() or 4
     
-    producer.join()
-    queue.shutdown()  # Sends None or wakes up consumer
-    consumer.join()
+    # Intelligently assign Producers based on the workload size and system cores
+    # We allocate 1 producer per ~10 zip codes, capping it at a max of (cpu_cores * 4) since these are I/O bound tasks
+    NUM_PRODUCERS = max(1, min(total_zips // 10 + 1, cpu_cores * 4))
     
+    # Intelligently assign Consumers based on the Producers (ratio of 4:1)
+    NUM_CONSUMERS = max(1, NUM_PRODUCERS // 4)
+    
+    logging.info(f"System detected {cpu_cores} cores. Dynamically provisioning {NUM_PRODUCERS} Producers and {NUM_CONSUMERS} Consumers for processing {total_zips} locations.")
+    
+    queue = ThreadSafeQueue(max_size=NUM_PRODUCERS * 10) # Dynamic capacity scaling for parallel pool
+    
+    chunk_size = math.ceil(total_zips / NUM_PRODUCERS)
+    if chunk_size == 0: chunk_size = 1
+    chunks = [zip_codes[i:i + chunk_size] for i in range(0, total_zips, chunk_size)]
+    
+    producers = []
+    for idx, chunk in enumerate(chunks):
+        p = Producer(queue, chunk)
+        p.name = f"Producer-{idx+1}"
+        p.start()
+        producers.append(p)
+        
+    csv_lock = threading.Lock()
+    with open(out_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Timestamp', 'Region (ZIP)', 'Latitude', 'Longitude', 
+                         'Temperature (C)', 'Precipitation (mm)', 'Wind Speed (km/h)', 
+                         'PM10', 'PM2.5', 'Ozone'])
+        
+        consumers = []
+        for i in range(NUM_CONSUMERS):
+            c = Consumer(queue, writer, csv_lock, name=f"Consumer-{i+1}")
+            c.start()
+            consumers.append(c)
+        
+        for p in producers:
+            p.join()
+            
+        queue.shutdown()  # Sends None or wakes up consumer
+        
+        for c in consumers:
+            c.join()
+            
     end_time = time.time()
     elapsed = end_time - start_time
     logging.info(f"--- Threaded Execution Finished in {elapsed:.2f} seconds ---")
@@ -306,11 +363,25 @@ if __name__ == "__main__":
     print("="*40)
     print("""
 ========================================
-DISCUSSION: CONDITION VARIABLES & SYNCHRONIZATION
+DISCUSSION:
 ========================================
-1. Deadlocks: In our pipeline, producers wait on a full queue and consumers wait on an empty queue. If neither `notify()` the other (e.g., due to an exception bypassing the notification step), they will deadlock indefinitely.
-2. Missed Signals: Using `Condition.wait()` inside a loop (`while len(queue) == 0: wait()`) ensures that if a signal is sent just before a thread waits, the thread inherently checks the state and doesn't wait forever.
-3. Race Conditions: Accessing the shared `deque` is wrapped in `with condition:` blocks, holding the underlying lock to guarantee memory safety.
-    
-Conclusion: Threading here heavily hides network latency (I/O bound work) when communicating with the Open-Meteo API. Synchronization via Condition variables ensures real-time pipeline pressure limits (the max_size of the queue) and safely orchestrates work across thread pools without data corruption.
+Think of our weather pipeline like a team project:
+- The Producers are the "Data Gatherers" (fetching weather/air JSONs from Open-Meteo).
+- The Consumers are the "Writers" (copying that data into the final CSV file).
+- The Queue is the "Inbox Folder" (it can only hold a few JSONs at once so the Writers don't get overwhelmed).
+
+Why do we need Condition Variables?
+If the Inbox is full, the Gatherers stop fetching and go to sleep. If the Inbox is empty, the Writers go to sleep because there's nothing to write. Condition variables are the "alarm clock" they ring to wake each other up!
+
+1. Deadlocks: 
+Imagine if the Inbox is full, all Gatherers fall asleep waiting for a Writer to process the JSONs. But all Writers are asleep too! If nobody rings the alarm to wake the others, everyone sleeps forever. That's a deadlock!
+
+2. Missed Signals:
+Imagine a Gatherer rings the alarm, but a Writer was distracted putting on their headphones. They miss the signal entirely! To fix this, Writers always double-check the Inbox before going back to sleep (`while len(queue) == 0: wait()`).
+
+3. Race Conditions:
+Imagine two Writers try to grab the exact same JSON dataset at the exact same split-second to write it to the CSV. They crash and corrupt the file! Our `with condition:` lock acts like a traffic cop, making sure only one Writer touches the Inbox at a time.
+
+Conclusion:
+Because fetching from Open-Meteo over the internet takes forever, having many Gatherers and Writers working together (Threading) makes the whole pipeline much faster than having just one script doing everything top-to-bottom.
 """)
